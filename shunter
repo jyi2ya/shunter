@@ -1,0 +1,197 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Fcntl;
+use Getopt::Long;
+use IO::Select;
+use IO::Socket;
+use POSIX;
+
+my $BUFSIZE = 8192;
+
+sub parse_forward_spec {
+    my ($spec) = @_;
+    return unless $spec;
+
+    my ($proto, $listen, $target) = $spec =~ m{^(tcp|udp)://([^/]+)/(.+)$};
+    return unless $proto && $listen && $target;
+
+    my ($listen_host, $listen_port) = split /:/, $listen, 2;
+    my ($target_host, $target_port) = split /:/, $target, 2;
+
+    return {
+        proto => $proto,
+        listen_host => $listen_host || '0.0.0.0',
+        listen_port => $listen_port,
+        target_host => $target_host,
+        target_port => $target_port
+    };
+}
+
+sub create_listener {
+    my ($proto, $host, $port) = @_;
+    my $socket;
+
+    if ($proto eq 'tcp') {
+        $socket = IO::Socket::INET->new(
+            LocalHost => $host,
+            LocalPort => $port,
+            Proto     => 'tcp',
+            Listen    => SOMAXCONN,
+            ReuseAddr => 1
+        ) or die "Cannot create TCP listener: $!";
+    } elsif ($proto eq 'udp') {
+        $socket = IO::Socket::INET->new(
+            LocalHost => $host,
+            LocalPort => $port,
+            Proto     => 'udp'
+        ) or die "Cannot create UDP listener: $!";
+    }
+
+    return $socket;
+}
+
+sub forward_data {
+    my ($src, $dst) = @_;
+    my $buf;
+    my $bytes = sysread($src, $buf, $BUFSIZE);
+    return unless $bytes;
+
+    my $written = syswrite($dst, $buf, $bytes);
+    unless ($written) {
+        warn "Write failed: $!";
+        return;
+    }
+
+    return $written;
+}
+
+my %connections;
+my $reading = IO::Select->new;
+my $writing = IO::Select->new;
+my %write_buffer;
+
+sub close_connection {
+    my ($fh) = @_;
+    my $peer = $connections{$fh};
+    delete @connections{($fh, $peer)};
+    $reading->remove($fh, $peer);
+    $writing->remove($fh, $peer);
+    delete @write_buffer{($fh, $peer)};
+    $fh->close;
+    $peer->close;
+}
+
+sub handle_connection {
+    my ($listener, $forward_info) = @_;
+    $reading->add($listener);
+
+    for (;;) {
+        my ($can_read, $can_write, $exception) = IO::Select::select($reading, $writing, undef);
+
+        for my $fh (@$can_write) {
+            my $buf = $write_buffer{$fh};
+            my $bytes = syswrite($fh, $buf, length($buf));
+            if ($bytes) {
+                $buf = substr $buf, $bytes;
+                if (length($buf)) {
+                    $write_buffer{$fh} = $buf;
+                } else {
+                    my $peer = $connections{$fh};
+                    delete $write_buffer{$fh};
+                    $writing->remove($fh);
+                    $reading->add($peer);
+                }
+            } else {
+                close_connection($fh);
+            }
+        }
+
+        for my $fh (@$can_read) {
+            if ($fh == $listener) {
+                my $client = $fh->accept;
+                $client->blocking(0);
+
+                my $target = IO::Socket::INET->new(
+                    PeerHost => $forward_info->{target_host},
+                    PeerPort => $forward_info->{target_port},
+                    Proto    => $forward_info->{proto},
+                    Blocking => 0
+                ) or do {
+                    warn "Cannot connect to target: $!";
+                    $client->close;
+                    next;
+                };
+
+                printf "new connection from %s:%d\n", $client->peerhost, $client->peerport;
+                printf "connections: %d, reading: %d, writing: %d\n", scalar(keys %connections), $reading->count, $writing->count;
+
+                $reading->add($client, $target);
+                $connections{$client} = $target;
+                $connections{$target} = $client;
+            } else {
+                my $buf;
+                my $bytes = sysread($fh, $buf, $BUFSIZE);
+                if ($bytes) {
+                    my $peer = $connections{$fh};
+                    $reading->remove($fh);
+                    $writing->add($peer);
+                    $write_buffer{$peer} = $buf;
+                } else {
+                    close_connection($fh);
+                }
+            }
+        }
+    }
+}
+
+sub start_forwarding {
+    my ($forward_info) = @_;
+    my $pid = fork();
+
+    if ($pid) {
+        # Parent process
+        return $pid;
+    } elsif (defined $pid) {
+        print "listening: $forward_info->{proto}://$forward_info->{listen_host}:$forward_info->{listen_port}\n";
+        # Child process
+        my $listener = create_listener(
+            $forward_info->{proto},
+            $forward_info->{listen_host},
+            $forward_info->{listen_port}
+        );
+
+        handle_connection($listener, $forward_info);
+        exit(0);
+    } else {
+        die "Cannot fork: $!";
+    }
+}
+
+sub main {
+    my @forward_specs;
+    GetOptions(
+        'L=s' => \@forward_specs,
+    ) or die "Invalid arguments";
+
+    die "No forward specifications provided" unless @forward_specs;
+
+    my @pids;
+    foreach my $spec (@forward_specs) {
+        my $forward_info = parse_forward_spec($spec);
+        unless ($forward_info) {
+            warn "Invalid forward specification: $spec";
+            next;
+        }
+
+        my $pid = start_forwarding($forward_info);
+        push @pids, $pid;
+    }
+
+    # Wait for children to exit (shouldn't happen normally)
+    foreach my $pid (@pids) {
+        waitpid($pid, 0);
+    }
+}
+
+main() unless caller();
