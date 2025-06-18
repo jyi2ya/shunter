@@ -124,7 +124,9 @@ sub handle_connection {
                 };
 
                 printf "new connection from %s:%d\n", $client->peerhost, $client->peerport;
-                printf "connections: %d, reading: %d, writing: %d\n", scalar(keys %connections), $reading->count, $writing->count;
+                my $fds = keys %connections;
+                my $conns = $fds / 2;
+                printf "fds: %d, connections: %d, reading: %d, writing: %d\n", $fds, $conns, $reading->count, $writing->count;
 
                 $reading->add($client, $target);
                 $connections{$client} = $target;
